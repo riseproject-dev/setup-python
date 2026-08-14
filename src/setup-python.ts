@@ -23,6 +23,19 @@ function isGraalPyVersion(versionSpec: string) {
   return versionSpec.startsWith('graalpy');
 }
 
+// `mirror` only redirects CPython distributions. PyPy and GraalPy resolve from
+// downloads.python.org and the GitHub releases API respectively, so warn rather
+// than let the input look like it applied.
+function warnIfMirrorUnsupported(versionSpec: string) {
+  if (!core.getInput('mirror')) {
+    return;
+  }
+  const implementation = isPyPyVersion(versionSpec) ? 'PyPy' : 'GraalPy';
+  core.warning(
+    `The 'mirror' input only applies to CPython distributions and is ignored for ${implementation} ('${versionSpec}'), which is downloaded from its own upstream source.`
+  );
+}
+
 async function cacheDependencies(cache: string, pythonVersion: string) {
   const cacheDependencyPath =
     core.getInput('cache-dependency-path') || undefined;
@@ -102,6 +115,7 @@ async function run() {
       core.startGroup('Installed versions');
       for (const version of versions) {
         if (isPyPyVersion(version)) {
+          warnIfMirrorUnsupported(version);
           const installed = await finderPyPy.findPyPyVersion(
             version,
             arch,
@@ -114,6 +128,7 @@ async function run() {
             `Successfully set up PyPy ${installed.resolvedPyPyVersion} with Python (${installed.resolvedPythonVersion})`
           );
         } else if (isGraalPyVersion(version)) {
+          warnIfMirrorUnsupported(version);
           const installed = await finderGraalPy.findGraalPyVersion(
             version,
             arch,

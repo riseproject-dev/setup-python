@@ -26,48 +26,99 @@ function getMirrorToken(): string {
   return core.getInput('mirror-token');
 }
 
+// Memoized per raw input value so the mirror is validated once per run rather
+// than on every call. `getManifestUrl()` is also used to build the "version not
+// found" message in find-python.ts, where re-validating would replace the real
+// cause with an invalid-mirror error.
+const mirrorCache = new Map<string, {url: string} | {error: Error}>();
+
 function getMirror(): string {
-  const raw = (core.getInput('mirror') || DEFAULT_MIRROR)
-    .trim()
-    .replace(/\/+$/, '');
-  try {
-    new URL(raw);
-  } catch {
-    throw new Error(`Invalid 'mirror' URL: "${raw}"`);
+  const input = core.getInput('mirror') || DEFAULT_MIRROR;
+  let resolved = mirrorCache.get(input);
+
+  if (!resolved) {
+    const url = input.trim().replace(/\/+$/, '');
+    try {
+      new URL(url);
+      resolved = {url};
+    } catch {
+      resolved = {error: new Error(`Invalid 'mirror' URL: "${url}"`)};
+    }
+    mirrorCache.set(input, resolved);
   }
-  return raw;
+
+  if ('error' in resolved) throw resolved.error;
+  return resolved.url;
 }
 
 export function getManifestUrl(): string {
   return `${getMirror()}/versions-manifest.json`;
 }
 
-function resolveRepoCoords(): {
+function getMirrorHost(): string | undefined {
+  try {
+    return new URL(getMirror()).host;
+  } catch {
+    return undefined;
+  }
+}
+
+function isGitHubHost(host: string): boolean {
+  return (
+    host === 'github.com' ||
+    host.endsWith('.github.com') ||
+    host.endsWith('.githubusercontent.com')
+  );
+}
+
+// Warned at most once per distinct mirror; resolveRepoCoords() is called from
+// several paths within a single run.
+const warnedMirrors = new Set<string>();
+
+export function resolveRepoCoords(): {
   owner: string;
   repo: string;
   branch: string;
 } | null {
-  const m = REPO_COORDS_RE.exec(getMirror());
-  return m ? {owner: m[1], repo: m[2], branch: m[3]} : null;
+  const mirror = getMirror();
+  const m = REPO_COORDS_RE.exec(mirror);
+  if (m) return {owner: m[1], repo: m[2], branch: m[3]};
+
+  // A raw.githubusercontent.com URL that doesn't parse is usually a branch
+  // name containing a slash, which is indistinguishable from a deeper path.
+  // Fetching still works, just anonymously and without the API rate limit.
+  if (
+    !warnedMirrors.has(mirror) &&
+    getMirrorHost() === 'raw.githubusercontent.com'
+  ) {
+    warnedMirrors.add(mirror);
+    core.warning(
+      `Could not parse owner/repo/branch out of mirror "${mirror}", so the manifest will be fetched by direct URL instead of the GitHub API. ` +
+        `Branch names containing '/' are not supported; use a branch without a slash to get the authenticated API rate limit.`
+    );
+  }
+
+  return null;
 }
 
+// Mirror host with `mirror-token` set gets the token verbatim, so internal
+// mirrors can choose their own scheme (Bearer, Basic, ...). GitHub hosts get
+// `token ${token}`. Anything else is anonymous — neither credential is sent to
+// a host the user didn't nominate.
 function authForUrl(url: string): string | undefined {
-  const mirrorToken = getMirrorToken();
-  if (mirrorToken) return `token ${mirrorToken}`;
   let host: string;
   try {
     host = new URL(url).host;
   } catch {
     return undefined;
   }
+
+  const mirrorToken = getMirrorToken();
+  if (mirrorToken && host === getMirrorHost()) return mirrorToken;
+
   const token = getToken();
-  if (
-    token &&
-    (host === 'github.com' ||
-      host.endsWith('.github.com') ||
-      host.endsWith('.githubusercontent.com'))
-  )
-    return `token ${token}`;
+  if (token && isGitHubHost(host)) return `token ${token}`;
+
   return undefined;
 }
 
@@ -260,15 +311,24 @@ async function fetchValidManifest(
 }
 
 export async function getManifest(): Promise<tc.IToolRelease[]> {
-  try {
-    return await fetchValidManifest('the GitHub API', getManifestFromRepo);
-  } catch (err) {
-    core.debug('Fetching the manifest via the API failed.');
-    if (err instanceof Error) {
-      core.debug(err.message);
-    } else {
-      core.debug('An unexpected error occurred while fetching the manifest.');
+  // Only GitHub repo mirrors can be fetched via the API. Checking up front
+  // avoids burning MANIFEST_FETCH_MAX_ATTEMPTS with backoff on a throw that
+  // could never succeed.
+  if (resolveRepoCoords()) {
+    try {
+      return await fetchValidManifest('the GitHub API', getManifestFromRepo);
+    } catch (err) {
+      core.debug('Fetching the manifest via the API failed.');
+      if (err instanceof Error) {
+        core.debug(err.message);
+      } else {
+        core.debug('An unexpected error occurred while fetching the manifest.');
+      }
     }
+  } else {
+    core.debug(
+      `Mirror "${getMirror()}" is not a GitHub repo URL; fetching the manifest by URL.`
+    );
   }
 
   try {
@@ -293,14 +353,17 @@ export function getManifestFromRepo(): Promise<tc.IToolRelease[]> {
   core.debug(
     `Getting manifest from ${coords.owner}/${coords.repo}@${coords.branch}`
   );
-  // api.github.com is a GitHub-owned URL. Prefer MIRROR_TOKEN (the user provided token), fall back to TOKEN.
+  // This only runs for GitHub repo mirrors, where `mirror-token` is the user's
+  // explicit intent for that repo. The target is always api.github.com, which
+  // requires the `token ` prefix, so the host rule in authForUrl() doesn't
+  // apply here.
   const token = getToken();
   const mirrorToken = getMirrorToken();
-  const auth = !mirrorToken
-    ? !token
-      ? undefined
-      : `token ${token}`
-    : `token ${mirrorToken}`;
+  const auth = mirrorToken
+    ? `token ${mirrorToken}`
+    : token
+      ? `token ${token}`
+      : undefined;
   return tc.getManifestFromRepo(coords.owner, coords.repo, auth, coords.branch);
 }
 
@@ -309,7 +372,11 @@ export async function getManifestFromURL(): Promise<tc.IToolRelease[]> {
 
   const manifestUrl = getManifestUrl();
   const http: httpm.HttpClient = new httpm.HttpClient('tool-cache');
-  const response = await http.getJson<tc.IToolRelease[]>(manifestUrl);
+  const auth = authForUrl(manifestUrl);
+  const response = await http.getJson<tc.IToolRelease[]>(
+    manifestUrl,
+    auth ? {authorization: auth} : undefined
+  );
   if (!response.result) {
     throw new Error(`Unable to get manifest from ${manifestUrl}`);
   }

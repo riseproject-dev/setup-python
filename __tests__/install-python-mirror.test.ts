@@ -82,8 +82,10 @@ const httpm = await import('@actions/http-client');
 const tc = await import('@actions/tool-cache');
 const {
   getManifestUrl,
+  getManifest,
   getManifestFromRepo,
   getManifestFromURL,
+  resolveRepoCoords,
   installCpythonFromRelease
 } = await import('../src/install-python.js');
 
@@ -142,6 +144,34 @@ describe('getManifestUrl', () => {
     setInputs({mirror: 'not a url'});
     expect(() => getManifestUrl()).toThrow(/Invalid 'mirror' URL/);
   });
+
+  it('keeps throwing the same error when called repeatedly', () => {
+    setInputs({mirror: 'not a url'});
+    expect(() => getManifestUrl()).toThrow(/Invalid 'mirror' URL/);
+    // Memoized, so the second call must not silently succeed or change shape —
+    // find-python.ts calls this while building the "version not found" message.
+    expect(() => getManifestUrl()).toThrow(/Invalid 'mirror' URL/);
+  });
+});
+
+describe('resolveRepoCoords', () => {
+  it('warns and returns null for a raw.githubusercontent.com mirror with a slash in the branch', () => {
+    setInputs({
+      mirror: 'https://raw.githubusercontent.com/foo/bar/feature/riscv'
+    });
+
+    expect(resolveRepoCoords()).toBeNull();
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringMatching(/Branch names containing '\/' are not supported/)
+    );
+  });
+
+  it('does not warn for a non-GitHub mirror', () => {
+    setInputs({mirror: 'https://mirror.example/py'});
+
+    expect(resolveRepoCoords()).toBeNull();
+    expect(core.warning).not.toHaveBeenCalled();
+  });
 });
 
 describe('getManifestFromRepo mirror resolution', () => {
@@ -193,9 +223,9 @@ describe('getManifestFromRepo mirror resolution', () => {
     );
   });
 
-  it('throws for a non-GitHub mirror so the caller falls back to the raw URL', () => {
+  it('returns null for a non-GitHub mirror so the caller uses the raw URL', () => {
     setInputs({mirror: 'https://mirror.example/py'});
-    expect(() => getManifestFromRepo()).toThrow(/not a GitHub repo URL/);
+    expect(resolveRepoCoords()).toBeNull();
     expect(tc.getManifestFromRepo).not.toHaveBeenCalled();
   });
 
@@ -209,6 +239,8 @@ describe('getManifestFromRepo mirror resolution', () => {
 
     await getManifestFromRepo();
 
+    // The API requires the `token ` prefix, and naming a repo mirror is explicit intent to
+    // read that repo, so mirror-token is prefixed here even though downloads send it verbatim.
     expect(tc.getManifestFromRepo).toHaveBeenCalledWith(
       'foo',
       'bar',
@@ -232,16 +264,78 @@ describe('getManifestFromRepo mirror resolution', () => {
 });
 
 describe('getManifestFromURL mirror resolution', () => {
-  it('fetches {mirror}/versions-manifest.json without attaching auth', async () => {
+  it('fetches {mirror}/versions-manifest.json without auth when no mirror-token is set', async () => {
     setInputs({token: 'TKN', mirror: 'https://mirror.example/py'});
     const getJson = jest.fn(async () => ({result: mockManifest}));
     (httpm.HttpClient as jest.Mock<any>).mockImplementation(() => ({getJson}));
 
     await getManifestFromURL();
 
+    // `token` must not reach a non-GitHub mirror.
     expect(getJson).toHaveBeenCalledWith(
-      'https://mirror.example/py/versions-manifest.json'
+      'https://mirror.example/py/versions-manifest.json',
+      undefined
     );
+  });
+
+  it('sends mirror-token verbatim on the manifest fetch', async () => {
+    setInputs({
+      token: 'TKN',
+      'mirror-token': 'Bearer MTOK',
+      mirror: 'https://mirror.example/py'
+    });
+    const getJson = jest.fn(async () => ({result: mockManifest}));
+    (httpm.HttpClient as jest.Mock<any>).mockImplementation(() => ({getJson}));
+
+    await getManifestFromURL();
+
+    expect(getJson).toHaveBeenCalledWith(
+      'https://mirror.example/py/versions-manifest.json',
+      {authorization: 'Bearer MTOK'}
+    );
+  });
+
+  it('sends token as a prefixed header for a GitHub-hosted raw manifest', async () => {
+    setInputs({
+      token: 'TKN',
+      mirror: 'https://raw.githubusercontent.com/foo/bar/refs/heads/main'
+    });
+    const getJson = jest.fn(async () => ({result: mockManifest}));
+    (httpm.HttpClient as jest.Mock<any>).mockImplementation(() => ({getJson}));
+
+    await getManifestFromURL();
+
+    expect(getJson).toHaveBeenCalledWith(
+      'https://raw.githubusercontent.com/foo/bar/refs/heads/main/versions-manifest.json',
+      {authorization: 'token TKN'}
+    );
+  });
+});
+
+describe('getManifest source routing', () => {
+  it('skips the GitHub API entirely for a non-GitHub mirror', async () => {
+    setInputs({mirror: 'https://mirror.example/py'});
+    const getJson = jest.fn(async () => ({result: mockManifest}));
+    (httpm.HttpClient as jest.Mock<any>).mockImplementation(() => ({getJson}));
+
+    await expect(getManifest()).resolves.toEqual(mockManifest);
+
+    // Routing straight to the URL fetch avoids 3 retries with backoff on a
+    // call that could never succeed.
+    expect(tc.getManifestFromRepo).not.toHaveBeenCalled();
+    expect(getJson).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the GitHub API for a repo mirror without touching the raw URL', async () => {
+    setInputs({token: 'TKN'});
+    (tc.getManifestFromRepo as jest.Mock<any>).mockResolvedValue(mockManifest);
+    const getJson = jest.fn(async () => ({result: mockManifest}));
+    (httpm.HttpClient as jest.Mock<any>).mockImplementation(() => ({getJson}));
+
+    await expect(getManifest()).resolves.toEqual(mockManifest);
+
+    expect(tc.getManifestFromRepo).toHaveBeenCalledTimes(1);
+    expect(getJson).not.toHaveBeenCalled();
   });
 });
 
@@ -311,21 +405,66 @@ describe('installCpythonFromRelease auth gating', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('forwards mirror-token to a non-GitHub download URL', async () => {
+  it('forwards mirror-token verbatim to the mirror host', async () => {
+    setInputs({
+      token: 'TKN',
+      'mirror-token': 'Bearer MTOK',
+      mirror: 'https://cdn.example'
+    });
+    await expect(
+      downloadAuthFor('https://cdn.example/py.tar.gz')
+    ).resolves.toBe('Bearer MTOK');
+  });
+
+  it('does not prefix or rewrite a mirror-token', async () => {
+    setInputs({
+      'mirror-token': 'Basic dXNlcjpwYXNz',
+      mirror: 'https://cdn.example'
+    });
+    await expect(
+      downloadAuthFor('https://cdn.example/py.tar.gz')
+    ).resolves.toBe('Basic dXNlcjpwYXNz');
+  });
+
+  it('withholds mirror-token from an incidental GitHub host and uses token there', async () => {
+    setInputs({
+      token: 'TKN',
+      'mirror-token': 'MTOK',
+      mirror: 'https://cdn.example'
+    });
+    // A manifest hosted on the private mirror may still point release assets at
+    // GitHub; the private credential must not follow them there.
+    await expect(
+      downloadAuthFor('https://objects.githubusercontent.com/x/python.tar.gz')
+    ).resolves.toBe('token TKN');
+  });
+
+  it('withholds mirror-token from a GitHub host when no token is set', async () => {
+    setInputs({'mirror-token': 'MTOK', mirror: 'https://cdn.example'});
+    await expect(
+      downloadAuthFor('https://objects.githubusercontent.com/x/python.tar.gz')
+    ).resolves.toBeUndefined();
+  });
+
+  it('withholds mirror-token from a third host that is neither the mirror nor GitHub', async () => {
     setInputs({
       token: 'TKN',
       'mirror-token': 'MTOK',
       mirror: 'https://cdn.example'
     });
     await expect(
-      downloadAuthFor('https://cdn.example/py.tar.gz')
-    ).resolves.toBe('token MTOK');
+      downloadAuthFor('https://other.example/py.tar.gz')
+    ).resolves.toBeUndefined();
   });
 
-  it('prefers mirror-token over token for GitHub download URLs', async () => {
-    setInputs({token: 'TKN', 'mirror-token': 'MTOK'});
+  it('uses mirror-token for a GitHub mirror host when it is the nominated host', async () => {
+    setInputs({
+      token: 'TKN',
+      'mirror-token': 'token MTOK',
+      mirror: 'https://raw.githubusercontent.com/foo/bar/main'
+    });
     await expect(
-      downloadAuthFor('https://github.com/o/r/releases/download/v/py.tar.gz')
+      downloadAuthFor('https://raw.githubusercontent.com/foo/bar/py.tar.gz')
     ).resolves.toBe('token MTOK');
   });
 

@@ -533,12 +533,12 @@ The manifest is resolved as follows:
 - If `mirror` matches `https://raw.githubusercontent.com/{owner}/{repo}/{branch}`, the manifest is fetched via the GitHub REST API (giving you the 5000/hr authenticated rate limit when a token is present).
 - Otherwise, the action fetches `{mirror}/versions-manifest.json` via a direct HTTP GET.
 
-Authentication:
+Authentication is decided by the host of each request, so neither credential reaches a server you did not nominate:
 
-- `token` is forwarded **only** to `github.com` and hosts under `*.github.com` or `*.githubusercontent.com`. It is never sent to a custom mirror.
-- `mirror-token` takes precedence over `token`: if `mirror-token` is set it is used for every authenticated request (manifest fetch and tarball downloads).
-- If `mirror-token` is empty, `token` is used when the target URL is GitHub-owned.
-- If neither applies, requests are anonymous.
+- Requests to the host named in `mirror` use `mirror-token`, sent **verbatim** as the `Authorization` header. Include a scheme if your mirror expects one — `Bearer <token>`, `Basic <base64>`, or `token <token>` for a GitHub host. This covers both the manifest fetch and the tarball downloads.
+- Requests to `github.com`, `*.github.com`, or `*.githubusercontent.com` use `token`, sent as `token <token>`. A manifest that points its `download_url` at a GitHub host therefore keeps working without `mirror-token` being leaked to it.
+- Any other host is requested anonymously.
+- One exception: when `mirror` is a GitHub repo URL, the manifest is fetched from `api.github.com`, and `mirror-token` is preferred there (with the `token ` prefix the API requires) because naming a repo mirror is an explicit instruction to read that repo.
 
 Point at a personal fork of `actions/python-versions` (uses the default `token`, fetched via the GitHub API):
 
@@ -558,6 +558,11 @@ Point at an internal mirror with its own credential:
     mirror: https://python-mirror.internal.example
     mirror-token: ${{ secrets.PYTHON_MIRROR_TOKEN }}
 ```
+
+Caveats:
+
+- `mirror` and `mirror-token` apply to **CPython only**. PyPy resolves from `downloads.python.org` and GraalPy from the GitHub releases API; both ignore these inputs, and the action warns if you set `mirror` alongside a `pypy-*` or `graalpy-*` version.
+- Branch names containing `/` cannot be used with a `raw.githubusercontent.com` mirror, because `.../{owner}/{repo}/feature/riscv` is indistinguishable from a repo path. Such a mirror still works, but falls back to an anonymous direct GET with the 60/hr unauthenticated rate limit; the action warns when this happens. Use a branch without a slash to get the API path.
 
 ### PyPy
 

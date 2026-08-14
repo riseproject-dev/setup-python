@@ -98705,29 +98705,69 @@ function getToken() {
 function getMirrorToken() {
     return getInput('mirror-token');
 }
+// Memoized per raw input value so the mirror is validated once per run rather
+// than on every call. `getManifestUrl()` is also used to build the "version not
+// found" message in find-python.ts, where re-validating would replace the real
+// cause with an invalid-mirror error.
+const mirrorCache = new Map();
 function getMirror() {
-    const raw = (getInput('mirror') || DEFAULT_MIRROR)
-        .trim()
-        .replace(/\/+$/, '');
-    try {
-        new URL(raw);
+    const input = getInput('mirror') || DEFAULT_MIRROR;
+    let resolved = mirrorCache.get(input);
+    if (!resolved) {
+        const url = input.trim().replace(/\/+$/, '');
+        try {
+            new URL(url);
+            resolved = { url };
+        }
+        catch {
+            resolved = { error: new Error(`Invalid 'mirror' URL: "${url}"`) };
+        }
+        mirrorCache.set(input, resolved);
     }
-    catch {
-        throw new Error(`Invalid 'mirror' URL: "${raw}"`);
-    }
-    return raw;
+    if ('error' in resolved)
+        throw resolved.error;
+    return resolved.url;
 }
 function getManifestUrl() {
     return `${getMirror()}/versions-manifest.json`;
 }
-function resolveRepoCoords() {
-    const m = REPO_COORDS_RE.exec(getMirror());
-    return m ? { owner: m[1], repo: m[2], branch: m[3] } : null;
+function getMirrorHost() {
+    try {
+        return new URL(getMirror()).host;
+    }
+    catch {
+        return undefined;
+    }
 }
+function isGitHubHost(host) {
+    return (host === 'github.com' ||
+        host.endsWith('.github.com') ||
+        host.endsWith('.githubusercontent.com'));
+}
+// Warned at most once per distinct mirror; resolveRepoCoords() is called from
+// several paths within a single run.
+const warnedMirrors = new Set();
+function resolveRepoCoords() {
+    const mirror = getMirror();
+    const m = REPO_COORDS_RE.exec(mirror);
+    if (m)
+        return { owner: m[1], repo: m[2], branch: m[3] };
+    // A raw.githubusercontent.com URL that doesn't parse is usually a branch
+    // name containing a slash, which is indistinguishable from a deeper path.
+    // Fetching still works, just anonymously and without the API rate limit.
+    if (!warnedMirrors.has(mirror) &&
+        getMirrorHost() === 'raw.githubusercontent.com') {
+        warnedMirrors.add(mirror);
+        warning(`Could not parse owner/repo/branch out of mirror "${mirror}", so the manifest will be fetched by direct URL instead of the GitHub API. ` +
+            `Branch names containing '/' are not supported; use a branch without a slash to get the authenticated API rate limit.`);
+    }
+    return null;
+}
+// Mirror host with `mirror-token` set gets the token verbatim, so internal
+// mirrors can choose their own scheme (Bearer, Basic, ...). GitHub hosts get
+// `token ${token}`. Anything else is anonymous — neither credential is sent to
+// a host the user didn't nominate.
 function authForUrl(url) {
-    const mirrorToken = getMirrorToken();
-    if (mirrorToken)
-        return `token ${mirrorToken}`;
     let host;
     try {
         host = new URL(url).host;
@@ -98735,11 +98775,11 @@ function authForUrl(url) {
     catch {
         return undefined;
     }
+    const mirrorToken = getMirrorToken();
+    if (mirrorToken && host === getMirrorHost())
+        return mirrorToken;
     const token = getToken();
-    if (token &&
-        (host === 'github.com' ||
-            host.endsWith('.github.com') ||
-            host.endsWith('.githubusercontent.com')))
+    if (token && isGitHubHost(host))
         return `token ${token}`;
     return undefined;
 }
@@ -98868,17 +98908,25 @@ async function fetchValidManifest(source, fetcher) {
     throw new Error(`Failed to fetch a valid manifest from ${source} after ${attempts} attempt(s): ${lastError?.message}`);
 }
 async function getManifest() {
-    try {
-        return await fetchValidManifest('the GitHub API', install_python_getManifestFromRepo);
+    // Only GitHub repo mirrors can be fetched via the API. Checking up front
+    // avoids burning MANIFEST_FETCH_MAX_ATTEMPTS with backoff on a throw that
+    // could never succeed.
+    if (resolveRepoCoords()) {
+        try {
+            return await fetchValidManifest('the GitHub API', install_python_getManifestFromRepo);
+        }
+        catch (err) {
+            core_debug('Fetching the manifest via the API failed.');
+            if (err instanceof Error) {
+                core_debug(err.message);
+            }
+            else {
+                core_debug('An unexpected error occurred while fetching the manifest.');
+            }
+        }
     }
-    catch (err) {
-        core_debug('Fetching the manifest via the API failed.');
-        if (err instanceof Error) {
-            core_debug(err.message);
-        }
-        else {
-            core_debug('An unexpected error occurred while fetching the manifest.');
-        }
+    else {
+        core_debug(`Mirror "${getMirror()}" is not a GitHub repo URL; fetching the manifest by URL.`);
     }
     try {
         return await fetchValidManifest('the raw URL', getManifestFromURL);
@@ -98895,21 +98943,25 @@ function install_python_getManifestFromRepo() {
         throw new Error(`Mirror "${getMirror()}" is not a GitHub repo URL; falling back to raw URL fetch.`);
     }
     core_debug(`Getting manifest from ${coords.owner}/${coords.repo}@${coords.branch}`);
-    // api.github.com is a GitHub-owned URL. Prefer MIRROR_TOKEN (the user provided token), fall back to TOKEN.
+    // This only runs for GitHub repo mirrors, where `mirror-token` is the user's
+    // explicit intent for that repo. The target is always api.github.com, which
+    // requires the `token ` prefix, so the host rule in authForUrl() doesn't
+    // apply here.
     const token = getToken();
     const mirrorToken = getMirrorToken();
-    const auth = !mirrorToken
-        ? !token
-            ? undefined
-            : `token ${token}`
-        : `token ${mirrorToken}`;
+    const auth = mirrorToken
+        ? `token ${mirrorToken}`
+        : token
+            ? `token ${token}`
+            : undefined;
     return getManifestFromRepo(coords.owner, coords.repo, auth, coords.branch);
 }
 async function getManifestFromURL() {
     core_debug('Falling back to fetching the manifest using raw URL.');
     const manifestUrl = getManifestUrl();
     const http = new lib_HttpClient('tool-cache');
-    const response = await http.getJson(manifestUrl);
+    const auth = authForUrl(manifestUrl);
+    const response = await http.getJson(manifestUrl, auth ? { authorization: auth } : undefined);
     if (!response.result) {
         throw new Error(`Unable to get manifest from ${manifestUrl}`);
     }
@@ -103495,6 +103547,16 @@ function isPyPyVersion(versionSpec) {
 function isGraalPyVersion(versionSpec) {
     return versionSpec.startsWith('graalpy');
 }
+// `mirror` only redirects CPython distributions. PyPy and GraalPy resolve from
+// downloads.python.org and the GitHub releases API respectively, so warn rather
+// than let the input look like it applied.
+function warnIfMirrorUnsupported(versionSpec) {
+    if (!getInput('mirror')) {
+        return;
+    }
+    const implementation = isPyPyVersion(versionSpec) ? 'PyPy' : 'GraalPy';
+    warning(`The 'mirror' input only applies to CPython distributions and is ignored for ${implementation} ('${versionSpec}'), which is downloaded from its own upstream source.`);
+}
 async function cacheDependencies(cache, pythonVersion) {
     const cacheDependencyPath = getInput('cache-dependency-path') || undefined;
     const cacheDistributor = getCacheDistributor(cache, pythonVersion, cacheDependencyPath);
@@ -103556,11 +103618,13 @@ async function run() {
             startGroup('Installed versions');
             for (const version of versions) {
                 if (isPyPyVersion(version)) {
+                    warnIfMirrorUnsupported(version);
                     const installed = await findPyPyVersion(version, arch, updateEnvironment, checkLatest, allowPreReleases);
                     pythonVersion = `${installed.resolvedPyPyVersion}-${installed.resolvedPythonVersion}`;
                     info(`Successfully set up PyPy ${installed.resolvedPyPyVersion} with Python (${installed.resolvedPythonVersion})`);
                 }
                 else if (isGraalPyVersion(version)) {
+                    warnIfMirrorUnsupported(version);
                     const installed = await findGraalPyVersion(version, arch, updateEnvironment, checkLatest, allowPreReleases);
                     pythonVersion = `${installed}`;
                     info(`Successfully set up GraalPy ${installed}`);
