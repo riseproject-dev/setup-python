@@ -98697,8 +98697,11 @@ const DEFAULT_REPO_OWNER = 'actions';
 const DEFAULT_REPO_NAME = 'python-versions';
 const DEFAULT_REPO_BRANCH = 'main';
 const DEFAULT_MIRROR = `https://raw.githubusercontent.com/${DEFAULT_REPO_OWNER}/${DEFAULT_REPO_NAME}/${DEFAULT_REPO_BRANCH}`;
-// Matches https://raw.githubusercontent.com/{owner}/{repo}/{branch}
-const REPO_COORDS_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/?$/;
+// Matches https://raw.githubusercontent.com/{owner}/{repo}/{branch} and the
+// equivalent https://raw.githubusercontent.com/{owner}/{repo}/refs/heads/{branch}
+// form, capturing the bare branch in both. The GitHub tree API wants the bare
+// branch, so the optional refs/heads/ prefix is consumed, not captured.
+const REPO_COORDS_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/(?:refs\/heads\/)?([^/]+)\/?$/;
 function getToken() {
     return getInput('token');
 }
@@ -98731,13 +98734,26 @@ function getMirror() {
 function getManifestUrl() {
     return `${getMirror()}/versions-manifest.json`;
 }
-function getMirrorHost() {
-    try {
-        return new URL(getMirror()).host;
-    }
-    catch {
-        return undefined;
-    }
+// Whether the user set `mirror` to something other than the built-in default.
+// action.yml gives `mirror` a default, so core.getInput('mirror') is never
+// empty; callers that want "did the user opt into a custom mirror" must compare
+// against DEFAULT_MIRROR rather than test for a falsy input. Normalizes the
+// same way getMirror() does but never throws, so a warning path can call it
+// even when the mirror is malformed.
+function isMirrorCustomized() {
+    const input = getInput('mirror');
+    if (!input)
+        return false;
+    return input.trim().replace(/\/+$/, '') !== DEFAULT_MIRROR;
+}
+// Origin (scheme + host + port) of the mirror, so `mirror-token` is matched
+// against the exact origin the user nominated. Comparing origin rather than
+// host alone means a manifest served over https that points a download_url at
+// http://same-host/... does NOT get the token — the scheme must match too.
+// Deliberately not wrapped in try/catch: an invalid mirror throws here just as
+// it does in getManifestUrl(), so both agree a bad mirror is fatal.
+function getMirrorOrigin() {
+    return new URL(getMirror()).origin;
 }
 function isGitHubHost(host) {
     return (host === 'github.com' ||
@@ -98752,34 +98768,36 @@ function resolveRepoCoords() {
     const m = REPO_COORDS_RE.exec(mirror);
     if (m)
         return { owner: m[1], repo: m[2], branch: m[3] };
-    // A raw.githubusercontent.com URL that doesn't parse is usually a branch
-    // name containing a slash, which is indistinguishable from a deeper path.
-    // Fetching still works, just anonymously and without the API rate limit.
-    if (!warnedMirrors.has(mirror) &&
-        getMirrorHost() === 'raw.githubusercontent.com') {
+    // A raw.githubusercontent.com URL that doesn't parse is a branch name
+    // containing a slash (e.g. .../{owner}/{repo}/feature/riscv), which is
+    // indistinguishable from a deeper path. getMirror() succeeded above, so the
+    // URL is well-formed and this parse cannot throw.
+    const isRawGitHub = new URL(mirror).host === 'raw.githubusercontent.com';
+    if (!warnedMirrors.has(mirror) && isRawGitHub) {
         warnedMirrors.add(mirror);
-        warning(`Could not parse owner/repo/branch out of mirror "${mirror}", so the manifest will be fetched by direct URL instead of the GitHub API. ` +
-            `Branch names containing '/' are not supported; use a branch without a slash to get the authenticated API rate limit.`);
+        warning(`Could not parse owner/repo/branch out of mirror "${mirror}", so the manifest will be fetched directly from the raw URL instead of through the GitHub REST API. ` +
+            `The request is still authenticated with your token, because raw.githubusercontent.com is a GitHub host. ` +
+            `Branch names containing '/' are not supported for the REST API path; use a branch without a slash if you want the manifest fetched through the API.`);
     }
     return null;
 }
-// Mirror host with `mirror-token` set gets the token verbatim, so internal
+// Mirror origin with `mirror-token` set gets the token verbatim, so internal
 // mirrors can choose their own scheme (Bearer, Basic, ...). GitHub hosts get
 // `token ${token}`. Anything else is anonymous — neither credential is sent to
 // a host the user didn't nominate.
 function authForUrl(url) {
-    let host;
+    let parsed;
     try {
-        host = new URL(url).host;
+        parsed = new URL(url);
     }
     catch {
         return undefined;
     }
     const mirrorToken = getMirrorToken();
-    if (mirrorToken && host === getMirrorHost())
+    if (mirrorToken && parsed.origin === getMirrorOrigin())
         return mirrorToken;
     const token = getToken();
-    if (token && isGitHubHost(host))
+    if (token && isGitHubHost(parsed.host))
         return `token ${token}`;
     return undefined;
 }
@@ -103541,6 +103559,7 @@ function getCacheDistributor(packageManager, pythonVersion, cacheDependencyPath)
 
 
 
+
 function isPyPyVersion(versionSpec) {
     return versionSpec.startsWith('pypy');
 }
@@ -103549,9 +103568,11 @@ function isGraalPyVersion(versionSpec) {
 }
 // `mirror` only redirects CPython distributions. PyPy and GraalPy resolve from
 // downloads.python.org and the GitHub releases API respectively, so warn rather
-// than let the input look like it applied.
+// than let the input look like it applied. Only warns when the user actually
+// set a custom mirror: action.yml gives `mirror` a default, so a plain
+// getInput() check would fire on every pypy-*/graalpy-* run.
 function warnIfMirrorUnsupported(versionSpec) {
-    if (!getInput('mirror')) {
+    if (!isMirrorCustomized()) {
         return;
     }
     const implementation = isPyPyVersion(versionSpec) ? 'PyPy' : 'GraalPy';

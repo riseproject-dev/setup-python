@@ -562,7 +562,7 @@ Point at an internal mirror with its own credential:
 Caveats:
 
 - `mirror` and `mirror-token` apply to **CPython only**. PyPy resolves from `downloads.python.org` and GraalPy from the GitHub releases API; both ignore these inputs, and the action warns if you set `mirror` alongside a `pypy-*` or `graalpy-*` version.
-- Branch names containing `/` cannot be used with a `raw.githubusercontent.com` mirror, because `.../{owner}/{repo}/feature/riscv` is indistinguishable from a repo path. Such a mirror still works, but falls back to an anonymous direct GET with the 60/hr unauthenticated rate limit; the action warns when this happens. Use a branch without a slash to get the API path.
+- Branch names containing `/` cannot be used with a `raw.githubusercontent.com` mirror, because `.../{owner}/{repo}/feature/riscv` is indistinguishable from a repo path. Such a mirror still works and is still authenticated with your `token` (raw.githubusercontent.com is a GitHub host), but the manifest is fetched directly from the raw URL rather than through the GitHub REST API; the action warns when this happens. Use a branch without a slash to get the REST API path. The `refs/heads/{branch}` form (for example `.../actions/python-versions/refs/heads/main`) is recognized and routes through the REST API.
 
 ### PyPy
 

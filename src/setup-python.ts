@@ -2,6 +2,7 @@ import * as core from '@actions/core';
 import * as finder from './find-python.js';
 import * as finderPyPy from './find-pypy.js';
 import * as finderGraalPy from './find-graalpy.js';
+import {isMirrorCustomized} from './install-python.js';
 import * as path from 'path';
 import * as os from 'os';
 import {fileURLToPath} from 'url';
@@ -25,9 +26,11 @@ function isGraalPyVersion(versionSpec: string) {
 
 // `mirror` only redirects CPython distributions. PyPy and GraalPy resolve from
 // downloads.python.org and the GitHub releases API respectively, so warn rather
-// than let the input look like it applied.
+// than let the input look like it applied. Only warns when the user actually
+// set a custom mirror: action.yml gives `mirror` a default, so a plain
+// getInput() check would fire on every pypy-*/graalpy-* run.
 function warnIfMirrorUnsupported(versionSpec: string) {
-  if (!core.getInput('mirror')) {
+  if (!isMirrorCustomized()) {
     return;
   }
   const implementation = isPyPyVersion(versionSpec) ? 'PyPy' : 'GraalPy';

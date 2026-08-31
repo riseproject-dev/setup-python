@@ -86,6 +86,7 @@ const {
   getManifestFromRepo,
   getManifestFromURL,
   resolveRepoCoords,
+  isMirrorCustomized,
   installCpythonFromRelease
 } = await import('../src/install-python.js');
 
@@ -152,6 +153,55 @@ describe('getManifestUrl', () => {
     // find-python.ts calls this while building the "version not found" message.
     expect(() => getManifestUrl()).toThrow(/Invalid 'mirror' URL/);
   });
+
+  it('treats an invalid mirror as fatal on the auth path too', async () => {
+    // getManifestUrl() throws on a bad mirror; the auth resolution must agree
+    // rather than swallow the error and quietly skip the mirror-token branch.
+    setInputs({'mirror-token': 'MTOK', mirror: 'not a url'});
+    (tc.downloadTool as jest.Mock<any>).mockResolvedValue('/tmp/py.tgz');
+    (tc.extractTar as jest.Mock<any>).mockResolvedValue('/tmp/extracted');
+
+    const release = {
+      version: '3.12.0',
+      stable: true,
+      files: [
+        {
+          filename: 'python-3.12.0-linux-x64.tar.gz',
+          platform: 'linux',
+          arch: 'x64',
+          download_url: 'https://cdn.example/py.tar.gz'
+        }
+      ]
+    } as any;
+
+    await expect(installCpythonFromRelease(release)).rejects.toThrow(
+      /Invalid 'mirror' URL/
+    );
+  });
+});
+
+describe('isMirrorCustomized', () => {
+  it('is false when the mirror input is empty', () => {
+    expect(isMirrorCustomized()).toBe(false);
+  });
+
+  it('is false when the mirror input equals the default', () => {
+    // action.yml gives `mirror` this exact default, so getInput() returns it on
+    // every run where the user did not set one. The PyPy/GraalPy warning must
+    // not fire in that case.
+    setInputs({mirror: DEFAULT_MIRROR});
+    expect(isMirrorCustomized()).toBe(false);
+  });
+
+  it('is false when the mirror input is the default with trailing slashes', () => {
+    setInputs({mirror: `${DEFAULT_MIRROR}///`});
+    expect(isMirrorCustomized()).toBe(false);
+  });
+
+  it('is true when the mirror input is a custom URL', () => {
+    setInputs({mirror: 'https://mirror.example/py'});
+    expect(isMirrorCustomized()).toBe(true);
+  });
 });
 
 describe('resolveRepoCoords', () => {
@@ -164,6 +214,22 @@ describe('resolveRepoCoords', () => {
     expect(core.warning).toHaveBeenCalledWith(
       expect.stringMatching(/Branch names containing '\/' are not supported/)
     );
+  });
+
+  it('parses the refs/heads/{branch} form to the bare branch without warning', () => {
+    setInputs({
+      mirror:
+        'https://raw.githubusercontent.com/actions/python-versions/refs/heads/main'
+    });
+
+    expect(resolveRepoCoords()).toEqual({
+      owner: 'actions',
+      repo: 'python-versions',
+      branch: 'main'
+    });
+    // refs/heads/main is a valid single branch, so it must route through the
+    // API path and never hit the slash-branch warning.
+    expect(core.warning).not.toHaveBeenCalled();
   });
 
   it('does not warn for a non-GitHub mirror', () => {
@@ -215,6 +281,25 @@ describe('getManifestFromRepo mirror resolution', () => {
 
     await getManifestFromRepo();
 
+    expect(tc.getManifestFromRepo).toHaveBeenCalledWith(
+      'foo',
+      'bar',
+      'token TKN',
+      'main'
+    );
+  });
+
+  it('resolves the refs/heads/{branch} form to the bare branch for the API', async () => {
+    setInputs({
+      token: 'TKN',
+      mirror: 'https://raw.githubusercontent.com/foo/bar/refs/heads/main'
+    });
+    (tc.getManifestFromRepo as jest.Mock<any>).mockResolvedValue(mockManifest);
+
+    await getManifestFromRepo();
+
+    // The GitHub tree API takes a bare branch, so the refs/heads/ prefix must
+    // be stripped rather than passed through as part of the branch name.
     expect(tc.getManifestFromRepo).toHaveBeenCalledWith(
       'foo',
       'bar',
@@ -296,9 +381,13 @@ describe('getManifestFromURL mirror resolution', () => {
   });
 
   it('sends token as a prefixed header for a GitHub-hosted raw manifest', async () => {
+    // A slash-branch URL genuinely falls to the direct-URL path (it does not
+    // match the {owner}/{repo}/{branch} shape). raw.githubusercontent.com is a
+    // GitHub host, so the token is still attached here — contradicting any
+    // claim that the fallback fetch is anonymous.
     setInputs({
       token: 'TKN',
-      mirror: 'https://raw.githubusercontent.com/foo/bar/refs/heads/main'
+      mirror: 'https://raw.githubusercontent.com/foo/bar/feature/riscv'
     });
     const getJson = jest.fn(async () => ({result: mockManifest}));
     (httpm.HttpClient as jest.Mock<any>).mockImplementation(() => ({getJson}));
@@ -306,7 +395,7 @@ describe('getManifestFromURL mirror resolution', () => {
     await getManifestFromURL();
 
     expect(getJson).toHaveBeenCalledWith(
-      'https://raw.githubusercontent.com/foo/bar/refs/heads/main/versions-manifest.json',
+      'https://raw.githubusercontent.com/foo/bar/feature/riscv/versions-manifest.json',
       {authorization: 'token TKN'}
     );
   });
@@ -424,6 +513,41 @@ describe('installCpythonFromRelease auth gating', () => {
     await expect(
       downloadAuthFor('https://cdn.example/py.tar.gz')
     ).resolves.toBe('Basic dXNlcjpwYXNz');
+  });
+
+  it('withholds mirror-token from a same-host download URL on a different scheme', async () => {
+    setInputs({
+      'mirror-token': 'Bearer MTOK',
+      mirror: 'https://cdn.example'
+    });
+    // The mirror is https, but the manifest points a download_url at http on
+    // the same host. Matching on origin (scheme + host + port) rather than host
+    // alone keeps the token from going out in cleartext.
+    await expect(
+      downloadAuthFor('http://cdn.example/py.tar.gz')
+    ).resolves.toBeUndefined();
+  });
+
+  it('withholds mirror-token from a same-host download URL on a different port', async () => {
+    setInputs({
+      'mirror-token': 'Bearer MTOK',
+      mirror: 'https://cdn.example'
+    });
+    // Different port is a different origin, so the nominated credential must
+    // not follow.
+    await expect(
+      downloadAuthFor('https://cdn.example:8443/py.tar.gz')
+    ).resolves.toBeUndefined();
+  });
+
+  it('sends mirror-token to a same-origin download URL on an explicit port', async () => {
+    setInputs({
+      'mirror-token': 'Bearer MTOK',
+      mirror: 'https://cdn.example:8443'
+    });
+    await expect(
+      downloadAuthFor('https://cdn.example:8443/py.tar.gz')
+    ).resolves.toBe('Bearer MTOK');
   });
 
   it('withholds mirror-token from an incidental GitHub host and uses token there', async () => {
